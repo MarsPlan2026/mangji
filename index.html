@@ -1,0 +1,649 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <title>Enterprise Resource Panel - Quantum Phase Pass Pro (No Timer)</title>
+    <style>
+        :root {
+            --bg-color: #f1f3f5;
+            --panel-bg: #ffffff;
+            --border-color: #dee2e6;
+            --text-main: #212529;
+            --text-sub: #495057;
+            --accent-blue: #004ba0; 
+            --accent-green: #0b4122;
+            --accent-red: #b02a37;
+            --accent-purple: #6f42c1;
+        }
+        * { box-sizing: border-box; margin: 0; padding: 0; user-select: none; }
+        body {
+            background-color: var(--bg-color);
+            color: var(--text-main);
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+            overflow: hidden;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            min-height: 100vh;
+        }
+        #status-bar {
+            width: 900px;
+            display: flex; justify-content: space-between; align-items: center;
+            padding: 14px 24px; background: var(--panel-bg);
+            border: 1px solid var(--border-color); border-bottom: none;
+            border-radius: 12px 12px 0 0; font-size: 13px;
+            box-shadow: 0 4px 12px rgba(0,0,0,0.03);
+            z-index: 5;
+        }
+        .stat-highlight { color: var(--accent-blue); font-weight: 700; }
+        .stat-alert { color: var(--accent-red); font-weight: 700; }
+        #skill-icon {
+            padding: 3px 12px; border: 1px solid var(--accent-purple); border-radius: 4px;
+            font-size: 11px; font-weight: bold; color: var(--accent-purple);
+            background: rgba(111, 66, 193, 0.05);
+            transition: all 0.2s;
+            min-width: 90px; text-align: center;
+        }
+        #game-viewport {
+            position: relative; width: 900px; height: 650px;
+            border: 1px solid var(--border-color); border-radius: 0 0 12px 12px;
+            background: #ffffff; overflow: hidden;
+            box-shadow: 0 12px 36px rgba(0,0,0,0.06);
+        }
+        canvas { display: block; }
+        .overlay {
+            position: absolute; top: 0; left: 0; width: 100%; height: 100%;
+            display: flex; flex-direction: column; justify-content: center; align-items: center;
+            background: rgba(255, 255, 255, 0.97); z-index: 10;
+            backdrop-filter: blur(5px);
+            padding: 40px;
+        }
+    </style>
+</head>
+<body>
+    <div id="status-bar">
+        <div>Matrix Node: <span id="current-level" class="stat-highlight">1</span></div>
+        <div>物理视野半径: <span id="vision-px" class="stat-alert">160px</span></div>
+        <div>[Space] 穿梭状态: <span id="skill-icon">READY</span></div>
+    </div>
+    <div id="game-viewport">
+        <canvas id="gameCanvas" width="900" height="650"></canvas>
+        <div id="game-overlay" class="overlay">
+            <h2 id="overlay-title" style="font-size:22px; margin-bottom:14px; letter-spacing:1px; color:var(--accent-purple);">Quantum Phase Walk V3.8</h2>
+            <p id="overlay-desc" style="font-size:13px; color:var(--text-sub); text-align:center; line-height:1.8; max-width: 600px;">
+                请将鼠标移至屏幕中央绿色的 <span style="color:var(--accent-green); font-weight:bold;">[ 核心始点 ]</span> 激活量子球。<br><br>
+                🔎 <span style="color:var(--accent-blue); font-weight:bold;">1:1 绝对相机锁死</span>：相机视距与缩放不再随关卡改变！始终保持最精确的微观操作体验。<br>
+                🐢 <span style="color:var(--accent-purple); font-weight:bold;">精密摇杆死区</span>：设置了 20px 轴心静止区，鼠标贴近中心慢行，拉远快移。<br>
+                🕊️ <span style="color:var(--accent-green); font-weight:bold;">探索模式</span>：已解除时间同步限制，允许无限时自由破局与规划路线。
+            </p>
+        </div>
+    </div>
+
+    <script>
+        const canvas = document.getElementById('gameCanvas');
+        const ctx = canvas.getContext('2d');
+        
+        const V_WIDTH = 900;
+        const V_HEIGHT = 650;
+
+        let state = {
+            level: 1, isActive: false, isClearing: false,
+            worldWidth: 900, worldHeight: 650,
+            
+            player: { x: 40, y: 40 },
+            playerRadius: 5.5,  
+            
+            mouseInput: { dx: 0, dy: 0 }, 
+            sensitivity: 0.04,            
+            maxInputRadius: 150,          
+            deadZone: 20,                 
+            
+            enemy: { x: 0, y: 0, speed: 0, radius: 8.25, visionRadius: 136, isSpawned: false },
+            enemySpawnTimer: 0,       
+            isEnemyDelaying: false,   
+            
+            isGhostMode: false,          
+            hasTouchedWallInGhost: false,  
+            skillCooldown: false,
+            cdRemaining: 0.0, 
+            
+            lastTime: 0,
+            maxSpeed: 6.0,                
+            visionRadius: 160,            
+            
+            lines: [], rotators: [], patrolLines: [], checkpoints: []
+        };
+
+        const clearWords = [
+            "⚡ [PHASE_SUCCESS] 极限肉身强穿！多次循环穿墙完美破局！",
+            "✨ [DECODE_COMPLETED] 冷却节奏掌握得当，底层维度安全切入...",
+            "🌐 [NEXT_MATRIX] 关卡切入成功，后方量子追击者速度已平稳递增 75%。"
+        ];
+
+        function updateDifficultyParameters() {
+            state.worldWidth = 900 + (state.level - 1) * 450;
+            state.worldHeight = 650 + (state.level - 1) * 350;
+            
+            let baseEnemySpeed = state.maxSpeed * 0.16; 
+            state.enemy.speed = baseEnemySpeed + (state.level - 1) * (baseEnemySpeed * 0.75); 
+            
+            document.getElementById('vision-px').innerText = `${state.visionRadius}px`;
+        }
+
+        function forceResetPlayer() {
+            state.player.x = 40; state.player.y = 40;
+            state.mouseInput.dx = 0; state.mouseInput.dy = 0;
+            state.enemy.x = 0; state.enemy.y = 0;
+            state.enemy.isSpawned = false;
+            
+            state.enemySpawnTimer = 0;
+            state.isEnemyDelaying = false;
+            
+            state.isGhostMode = false;
+            state.hasTouchedWallInGhost = false;
+            state.skillCooldown = false;
+            state.cdRemaining = 0.0;
+        }
+
+        function resetSkillUI() {
+            const icon = document.getElementById('skill-icon');
+            icon.style.background = 'rgba(111, 66, 193, 0.05)'; 
+            icon.style.color = 'var(--accent-purple)';
+            icon.style.borderColor = 'var(--accent-purple)'; 
+            icon.innerText = "READY";
+        }
+
+        function getDistanceToSegment(px, py, x1, y1, x2, y2) {
+            let dx = x2 - x1; let dy = y2 - y1;
+            let l2 = dx*dx + dy*dy;
+            if (l2 === 0) return Math.sqrt((px-x1)**2 + (py-y1)**2);
+            let t = ((px - x1) * dx + (py - y1) * dy) / l2;
+            t = Math.max(0, Math.min(1, t));
+            return Math.sqrt((px - (x1 + t * dx))**2 + (py - (y1 + t * dy))**2);
+        }
+
+        function getDistanceToPath(px, py, pathPoints) {
+            let minDist = Infinity;
+            for(let i=0; i<pathPoints.length-1; i++) {
+                let d = getDistanceToSegment(px, py, pathPoints[i].x, pathPoints[i].y, pathPoints[i+1].x, pathPoints[i+1].y);
+                if(d < minDist) minDist = d;
+            }
+            return minDist;
+        }
+
+        function generateCompressedMaze() {
+            state.lines = [];
+            state.rotators = [];
+            state.patrolLines = [];
+            const W = state.worldWidth;
+            const H = state.worldHeight;
+
+            let segments = 3 + Math.min(state.level, 5); 
+            state.checkpoints = [{ x: 40, y: 40 }];
+            for (let i = 1; i < segments; i++) {
+                let ratio = i / segments;
+                let bx = W * ratio + (Math.random() - 0.5) * (W / segments * 0.6);
+                let by = H * ratio + (Math.random() - 0.5) * (H / segments * 0.6);
+                state.checkpoints.push({ x: bx, y: by });
+            }
+            state.checkpoints.push({ x: W - 40, y: H - 40 });
+
+            const safeRadius = 55; 
+
+            let trapCount = 6 + state.level * 4;
+            let trapPaths = [];
+            for (let t = 0; t < trapCount; t++) {
+                let startNode = state.checkpoints[Math.floor(Math.random() * (state.checkpoints.length - 2)) + 1];
+                let currentX = startNode.x; let currentY = startNode.y;
+                let trapLen = 3; let tPoints = [{ x: currentX, y: currentY }];
+                
+                for(let p=0; p<trapLen; p++) {
+                    let angle = Math.random() * Math.PI * 2;
+                    let len = 160 + Math.random() * 160;
+                    let nextX = currentX + Math.cos(angle) * len;
+                    let nextY = currentY + Math.sin(angle) * len;
+                    if(nextX > 50 && nextX < W - 50 && nextY > 50 && nextY < H - 50) {
+                        tPoints.push({ x: nextX, y: nextY });
+                        currentX = nextX; currentY = nextY;
+                    }
+                }
+                if(tPoints.length > 1) trapPaths.push(tPoints);
+            }
+
+            let obstacleCount = 45 + state.level * 20;
+            for(let k = 0; k < obstacleCount; k++) {
+                let cx = Math.random() * W; let cy = Math.random() * H;
+                let length = 200 + Math.random() * 300; let angle = Math.random() * Math.PI * 2;
+                let x1 = cx - Math.cos(angle) * (length/2); let y1 = cy - Math.sin(angle) * (length/2);
+                let x2 = cx + Math.cos(angle) * (length/2); let y2 = cy + Math.sin(angle) * (length/2);
+
+                let shouldBlock = false;
+                for(let t=0; t<=1; t+=0.06) {
+                    let sx = x1 + (x2 - x1) * t; let sy = y1 + (y2 - y1) * t;
+                    if(getDistanceToPath(sx, sy, state.checkpoints) < safeRadius) { shouldBlock = true; break; }
+                }
+                for(let path of trapPaths) {
+                    for(let t=0; t<=1; t+=0.06) {
+                        let sx = x1 + (x2 - x1) * t; let sy = y1 + (y2 - y1) * t;
+                        if(getDistanceToPath(sx, sy, path) < safeRadius - 10) { shouldBlock = true; break; }
+                    }
+                }
+                if(!shouldBlock && x1>0 && x2<W && y1>0 && y2<H) state.lines.push({ x1, y1, x2, y2 });
+            }
+
+            for(let path of trapPaths) {
+                let endNode = path[path.length - 1];
+                let a = Math.random() * Math.PI;
+                state.lines.push({
+                    x1: endNode.x - Math.cos(a)*60, y1: endNode.y - Math.sin(a)*60,
+                    x2: endNode.x + Math.cos(a)*60, y2: endNode.y + Math.sin(a)*60
+                });
+            }
+
+            let noiseLines = 65 + state.level * 25; 
+            for(let n=0; n<noiseLines; n++) {
+                let x1 = Math.random() * W; let y1 = Math.random() * H;
+                let len = 40 + Math.random() * 100; let ang = Math.random() * Math.PI*2;
+                let x2 = x1 + Math.cos(ang)*len; let y2 = y1 + Math.sin(ang)*len;
+                if(getDistanceToPath(x1, y1, state.checkpoints) > safeRadius) {
+                    if(x2>0 && x2<W && y2>0 && y2<H) state.lines.push({ x1, y1, x2, y2 });
+                }
+            }
+
+            let rotCount = 4 + Math.min(state.level, 10);
+            for(let r=0; r<rotCount; r++) {
+                let idx = Math.floor(Math.random() * (state.checkpoints.length - 2)) + 1;
+                let cp = state.checkpoints[idx];
+                let cx = cp.x + (Math.random() > 0.5 ? 30 : -30);
+                let cy = cp.y + (Math.random() > 0.5 ? 30 : -30);
+                let len = 50 + Math.random() * 50;
+                
+                let levelSpeedMultiplier = 1.0 + (state.level - 1) * 0.15; 
+                let speed = (0.8 + Math.random() * 1.2) * levelSpeedMultiplier * (Math.random() > 0.5 ? 1 : -1);
+                
+                if(getDistanceToPath(cx, cy, state.checkpoints) > 15) {
+                    state.rotators.push({ cx, cy, len, angle: Math.random()*Math.PI, speed });
+                }
+            }
+
+            let patrolCount = 5 + state.level * 3; 
+            for(let p=0; p<patrolCount; p++) {
+                let idx = Math.floor(Math.random() * (state.checkpoints.length - 2)) + 1;
+                let cp = state.checkpoints[idx];
+                
+                let cx = cp.x + (Math.random() - 0.5) * 100;
+                let cy = cp.y + (Math.random() - 0.5) * 100;
+                let len = 55 + Math.random() * 65;
+                let angle = Math.random() * Math.PI * 2;
+                
+                let moveAngle = angle + Math.PI / 2; 
+                let range = 65 + Math.random() * 75; 
+                
+                let basePatrolSpeed = 25 + Math.random() * 35;
+                let speed = basePatrolSpeed + (state.level - 1) * 6.0; 
+                
+                if(getDistanceToPath(cx, cy, state.checkpoints) > 12) {
+                    state.patrolLines.push({
+                        origCx: cx, origCy: cy, 
+                        cx: cx, cy: cy, 
+                        len, angle, moveAngle, range, speed,
+                        progress: Math.random() * Math.PI * 2 
+                    });
+                }
+            }
+        }
+
+        function initLevel() {
+            updateDifficultyParameters();
+            generateCompressedMaze();
+            
+            state.isActive = false; state.isClearing = false;
+            forceResetPlayer();
+
+            document.getElementById('game-overlay').style.display = 'flex';
+            document.getElementById('current-level').innerText = state.level;
+            
+            resetSkillUI();
+        }
+
+        function checkRawWallCollision(px, py) {
+            if (px < 0 || px > state.worldWidth || py < 0 || py > state.worldHeight) return true;
+            for (let line of state.lines) {
+                if (getDistanceToSegment(px, py, line.x1, line.y1, line.x2, line.y2) < (state.playerRadius + 0.6)) return true;
+            }
+            for (let r of state.rotators) {
+                let x1 = r.cx - Math.cos(r.angle) * (r.len / 2);
+                let y1 = r.cy - Math.sin(r.angle) * (r.len / 2);
+                let x2 = r.cx + Math.cos(r.angle) * (r.len / 2);
+                let y2 = r.cy + Math.sin(r.angle) * (r.len / 2);
+                if (getDistanceToSegment(px, py, x1, y1, x2, y2) < (state.playerRadius + 0.6)) return true;
+            }
+            for (let pl of state.patrolLines) {
+                let x1 = pl.cx - Math.cos(pl.angle) * (pl.len / 2);
+                let y1 = pl.cy - Math.sin(pl.angle) * (pl.len / 2);
+                let x2 = pl.cx + Math.cos(pl.angle) * (pl.len / 2);
+                let y2 = pl.cy + Math.sin(pl.angle) * (pl.len / 2);
+                if (getDistanceToSegment(px, py, x1, y1, x2, y2) < (state.playerRadius + 0.6)) return true;
+            }
+            return false;
+        }
+
+        function triggerPenalty(reason) {
+            state.isActive = false;
+            generateCompressedMaze(); 
+            updateDifficultyParameters();
+            
+            document.getElementById('overlay-title').innerText = "Matrix Crash";
+            document.getElementById('overlay-desc').innerHTML = `<span style="color:var(--accent-red); font-weight:bold;">${reason}</span><br>数据结构洗牌重连。请将鼠标**移出屏中绿区再重新移入**以激活。技能已安全重置。`;
+            document.getElementById('game-overlay').style.display = 'flex';
+            
+            forceResetPlayer();
+            resetSkillUI(); 
+        }
+
+        window.addEventListener('mousemove', (e) => {
+            const rect = canvas.getBoundingClientRect();
+            const mxCanvas = e.clientX - rect.left;
+            const myCanvas = e.clientY - rect.top;
+            
+            if (!state.isActive) {
+                if(state.isClearing) return;
+                const startBoxX = V_WIDTH / 2 - 37.5;
+                const startBoxY = V_HEIGHT / 2 - 37.5;
+                if (mxCanvas >= startBoxX && mxCanvas <= startBoxX + 75 && myCanvas >= startBoxY && myCanvas <= startBoxY + 75) {
+                    state.isActive = true;
+                    document.getElementById('game-overlay').style.display = 'none';
+                    
+                    state.mouseInput.dx = 0;
+                    state.mouseInput.dy = 0;
+                    state.enemy.x = 0; state.enemy.y = 0;
+                    state.enemy.isSpawned = false; 
+                    state.isEnemyDelaying = false;
+                    state.enemySpawnTimer = 0;
+                }
+            } else {
+                let dxCanvas = mxCanvas - V_WIDTH / 2;
+                let dyCanvas = myCanvas - V_HEIGHT / 2;
+                let inputDist = Math.sqrt(dxCanvas*dxCanvas + dyCanvas*dyCanvas);
+                
+                if (inputDist < state.deadZone) {
+                    dxCanvas = 0;
+                    dyCanvas = 0;
+                } else {
+                    if (inputDist > state.maxInputRadius) {
+                        dxCanvas = (dxCanvas / inputDist) * state.maxInputRadius;
+                        dyCanvas = (dyCanvas / inputDist) * state.maxInputRadius;
+                    }
+                }
+                
+                state.mouseInput.dx = dxCanvas;
+                state.mouseInput.dy = dyCanvas;
+            }
+        });
+
+        window.addEventListener('keydown', (e) => {
+            if(e.code === 'Space' && state.isActive && !state.skillCooldown && !state.isGhostMode) {
+                state.isGhostMode = true;
+                state.hasTouchedWallInGhost = false;
+                
+                const icon = document.getElementById('skill-icon');
+                icon.style.background = 'var(--accent-purple)'; icon.style.color = '#ffffff';
+                icon.innerText = "PHASE ACTIVE";
+            }
+        });
+
+        function startSkillCooldown() {
+            state.isGhostMode = false;
+            state.hasTouchedWallInGhost = false;
+            state.skillCooldown = true;
+            state.cdRemaining = 10.0; 
+            
+            const icon = document.getElementById('skill-icon');
+            icon.style.background = '#dee2e6'; icon.style.color = 'var(--text-sub)';
+            icon.style.borderColor = 'var(--border-color)';
+            icon.innerText = `CD: ${state.cdRemaining.toFixed(1)}s`;
+        }
+
+        function loop(timestamp) {
+            if(!state.lastTime) state.lastTime = timestamp;
+            let dt = (timestamp - state.lastTime) / 1000;
+            state.lastTime = timestamp;
+            if(dt > 0.1) dt = 0.1;
+
+            state.rotators.forEach(r => { r.angle += r.speed * dt; });
+
+            state.patrolLines.forEach(pl => {
+                pl.progress += (pl.speed / pl.range) * dt;
+                let offset = Math.sin(pl.progress) * pl.range;
+                pl.cx = pl.origCx + Math.cos(pl.moveAngle) * offset;
+                pl.cy = pl.origCy + Math.sin(pl.moveAngle) * offset;
+            });
+
+            if(state.isActive) {
+                const icon = document.getElementById('skill-icon');
+                if (state.isEnemyDelaying) {
+                    icon.style.background = 'rgba(176, 42, 55, 0.15)';
+                    icon.style.color = 'var(--accent-red)';
+                    icon.style.borderColor = 'var(--accent-red)';
+                    icon.innerText = "[ENEMY DELAY]";
+                } else if(state.skillCooldown) {
+                    state.cdRemaining = Math.max(0, state.cdRemaining - dt);
+                    if(state.cdRemaining > 0) {
+                        icon.innerText = `CD: ${state.cdRemaining.toFixed(1)}s`;
+                    } else {
+                        state.skillCooldown = false;
+                        resetSkillUI();
+                    }
+                }
+            }
+
+            if(state.isActive) {
+                let targetWorldX = state.player.x + state.mouseInput.dx * state.sensitivity;
+                let targetWorldY = state.player.y + state.mouseInput.dy * state.sensitivity;
+
+                let dx = targetWorldX - state.player.x; 
+                let dy = targetWorldY - state.player.y;
+                let dist = Math.sqrt(dx*dx + dy*dy);
+                
+                if(dist > state.maxSpeed) {
+                    dx = (dx / dist) * state.maxSpeed; dy = (dy / dist) * state.maxSpeed;
+                }
+                
+                let nextX = state.player.x + dx;
+                let nextY = state.player.y + dy;
+
+                let isCollidingNext = checkRawWallCollision(nextX, nextY);
+
+                if (state.isGhostMode) {
+                    state.player.x = Math.max(state.playerRadius, Math.min(state.worldWidth - state.playerRadius, nextX));
+                    state.player.y = Math.max(state.playerRadius, Math.min(state.worldHeight - state.playerRadius, nextY));
+                    
+                    if (isCollidingNext) {
+                        state.hasTouchedWallInGhost = true; 
+                    } else {
+                        if (state.hasTouchedWallInGhost) {
+                            startSkillCooldown(); 
+                        }
+                    }
+                } else {
+                    if(isCollidingNext) {
+                        triggerPenalty("常规形态误触高移动壁垒！必须要先按下 [Space] 键开启穿梭形态再穿过。");
+                    } else {
+                        state.player.x = nextX; state.player.y = nextY;
+                    }
+                }
+
+                if (!state.enemy.isSpawned && !state.isEnemyDelaying && (state.player.x > 75 || state.player.y > 75)) {
+                    state.isEnemyDelaying = true;
+                    state.enemySpawnTimer = 1.0; 
+                }
+
+                if (state.isEnemyDelaying) {
+                    state.enemySpawnTimer -= dt;
+                    if (state.enemySpawnTimer <= 0) {
+                        state.isEnemyDelaying = false;
+                        state.enemy.isSpawned = true; 
+                        state.enemy.x = 40;
+                        state.enemy.y = 40;
+                        
+                        if(!state.skillCooldown && !state.isGhostMode) {
+                            resetSkillUI();
+                        }
+                    }
+                }
+
+                if (state.enemy.isSpawned) {
+                    let edx = state.player.x - state.enemy.x;
+                    let edy = state.player.y - state.enemy.y;
+                    let eDist = Math.sqrt(edx*edx + edy*edy);
+                    
+                    let currentSafeSpeed = state.enemy.speed;
+                    let triggerDistance = (state.playerRadius + state.enemy.radius) * 5.0; 
+                    
+                    if (eDist < triggerDistance) {
+                        let ratio = Math.max(0.15, eDist / triggerDistance); 
+                        currentSafeSpeed = state.enemy.speed * ratio;
+                    }
+
+                    if (eDist > 1) {
+                        state.enemy.x += (edx / eDist) * currentSafeSpeed;
+                        state.enemy.y += (edy / eDist) * currentSafeSpeed;
+                    }
+
+                    if (eDist < (state.playerRadius + state.enemy.radius)) {
+                        triggerPenalty("暗影捕获！你被后方的量子追击者完全吞噬，底层防护强行断开。");
+                    }
+                }
+                
+                if(state.player.x > state.worldWidth - 75 && state.player.y > state.worldHeight - 75) {
+                    state.isActive = false; state.isClearing = true; 
+                    
+                    forceResetPlayer();
+                    resetSkillUI(); 
+                    
+                    const randomWord = clearWords[Math.floor(Math.random() * clearWords.length)];
+                    document.getElementById('overlay-title').innerText = `Node ${state.level} Solved`;
+                    document.getElementById('overlay-desc').innerHTML = `
+                        <span style="color:var(--accent-green); font-weight:bold;">${randomWord}</span><br><br>
+                        <span style="color:var(--text-main); font-weight:bold;">即将切入 Node ${state.level + 1}。<br>后方红球基础速度追加 75%。</span>
+                    `;
+                    document.getElementById('game-overlay').style.display = 'flex';
+                    setTimeout(() => { state.level++; initLevel(); }, 1800);
+                }
+            }
+
+            ctx.fillStyle = '#ffffff'; 
+            ctx.fillRect(0, 0, V_WIDTH, V_HEIGHT);
+
+            ctx.save();
+            ctx.translate(V_WIDTH / 2, V_HEIGHT / 2);
+            ctx.translate(-state.player.x, -state.player.y);
+
+            ctx.fillStyle = 'rgba(20, 108, 67, 0.12)'; ctx.fillRect(0, 0, 75, 75);
+            ctx.strokeStyle = 'rgba(20, 108, 67, 0.5)'; ctx.lineWidth = 2; ctx.strokeRect(0, 0, 75, 75);
+
+            ctx.fillStyle = 'rgba(0, 75, 160, 0.1)'; ctx.fillRect(state.worldWidth - 75, state.worldHeight - 75, 75, 75);
+            ctx.strokeStyle = 'rgba(0, 75, 160, 0.5)'; ctx.lineWidth = 2; ctx.strokeRect(state.worldWidth - 75, state.worldHeight - 75, 75, 75);
+
+            ctx.strokeStyle = '#dee2e6'; ctx.lineWidth = 4; ctx.strokeRect(0, 0, state.worldWidth, state.worldHeight);
+
+            ctx.lineWidth = 2.8; 
+            ctx.lineCap = 'round';
+            for (let line of state.lines) {
+                let midX = (line.x1 + line.x2) / 2; let midY = (line.y1 + line.y2) / 2;
+                let d1 = Math.sqrt((state.player.x - line.x1)**2 + (state.player.y - line.y1)**2);
+                let d2 = Math.sqrt((state.player.x - line.x2)**2 + (state.player.y - line.y2)**2);
+                let d3 = Math.sqrt((state.player.x - midX)**2 + (state.player.y - midY)**2);
+                let minDist = Math.min(d1, d2, d3);
+
+                let ed1 = Math.sqrt((state.enemy.x - line.x1)**2 + (state.enemy.y - line.y1)**2);
+                let ed2 = Math.sqrt((state.enemy.x - line.x2)**2 + (state.enemy.y - line.y2)**2);
+                let ed3 = Math.sqrt((state.enemy.x - midX)**2 + (state.enemy.y - midY)**2);
+                let enemyMinDist = Math.min(ed1, ed2, ed3);
+
+                if (minDist < state.visionRadius || (state.isActive && state.enemy.isSpawned && enemyMinDist < state.enemy.visionRadius)) {
+                    let alphaP = minDist < state.visionRadius ? (1 - (minDist / state.visionRadius)) : 0;
+                    let alphaE = (state.isActive && state.enemy.isSpawned && enemyMinDist < state.enemy.visionRadius) ? (1 - (enemyMinDist / state.enemy.visionRadius)) : 0;
+                    let alpha = Math.max(alphaP, alphaE);
+                    
+                    ctx.strokeStyle = `rgba(33, 37, 41, ${alpha * 0.95})`; 
+                    ctx.beginPath(); ctx.moveTo(line.x1, line.y1); ctx.lineTo(line.x2, line.y2); ctx.stroke();
+                }
+            }
+
+            ctx.lineWidth = 3.2;
+            for (let r of state.rotators) {
+                let distToCenter = Math.sqrt((state.player.x - r.cx)**2 + (state.player.y - r.cy)**2);
+                let enemyDistToCenter = Math.sqrt((state.enemy.x - r.cx)**2 + (state.enemy.y - r.cy)**2);
+                
+                if (distToCenter - r.len/2 < state.visionRadius || (state.isActive && state.enemy.isSpawned && enemyDistToCenter - r.len/2 < state.enemy.visionRadius)) {
+                    let alphaP = distToCenter - r.len/2 < state.visionRadius ? (1 - (Math.max(0, distToCenter - r.len/2) / state.visionRadius)) : 0;
+                    let alphaE = (state.isActive && state.enemy.isSpawned && enemyDistToCenter - r.len/2 < state.enemy.visionRadius) ? (1 - (Math.max(0, enemyDistToCenter - r.len/2) / state.enemy.visionRadius)) : 0;
+                    let alpha = Math.max(alphaP, alphaE);
+
+                    ctx.strokeStyle = `rgba(176, 42, 55, ${alpha * 0.95})`; 
+                    let x1 = r.cx - Math.cos(r.angle) * (r.len / 2);
+                    let y1 = r.cy - Math.sin(r.angle) * (r.len / 2);
+                    let x2 = r.cx + Math.cos(r.angle) * (r.len / 2);
+                    let y2 = r.cy + Math.sin(r.angle) * (r.len / 2);
+
+                    ctx.beginPath(); ctx.moveTo(x1, y1); ctx.lineTo(x2, y2); ctx.stroke();
+                    ctx.fillStyle = `rgba(176, 42, 55, ${alpha * 0.6})`;
+                    ctx.beginPath(); ctx.arc(r.cx, r.cy, 3.5, 0, Math.PI*2); ctx.fill();
+                }
+            }
+
+            ctx.lineWidth = 3.0;
+            for (let pl of state.patrolLines) {
+                let distToCenter = Math.sqrt((state.player.x - pl.cx)**2 + (state.player.y - pl.cy)**2);
+                let enemyDistToCenter = Math.sqrt((state.enemy.x - pl.cx)**2 + (state.enemy.y - pl.cy)**2);
+                
+                if (distToCenter - pl.len/2 < state.visionRadius || (state.isActive && state.enemy.isSpawned && enemyDistToCenter - pl.len/2 < state.enemy.visionRadius)) {
+                    let alphaP = distToCenter - pl.len/2 < state.visionRadius ? (1 - (Math.max(0, distToCenter - pl.len/2) / state.visionRadius)) : 0;
+                    let alphaE = (state.isActive && state.enemy.isSpawned && enemyDistToCenter - pl.len/2 < state.enemy.visionRadius) ? (1 - (Math.max(0, enemyDistToCenter - pl.len/2) / state.enemy.visionRadius)) : 0;
+                    let alpha = Math.max(alphaP, alphaE);
+
+                    ctx.strokeStyle = `rgba(0, 75, 160, ${alpha * 0.95})`; 
+                    let x1 = pl.cx - Math.cos(pl.angle) * (pl.len / 2);
+                    let y1 = pl.cy - Math.sin(pl.angle) * (pl.len / 2);
+                    let x2 = pl.cx + Math.cos(pl.angle) * (pl.len / 2);
+                    let y2 = pl.cy + Math.sin(pl.angle) * (pl.len / 2);
+
+                    ctx.beginPath(); ctx.moveTo(x1, y1); ctx.lineTo(x2, y2); ctx.stroke();
+                    ctx.fillStyle = `rgba(0, 75, 160, ${alpha * 0.8})`;
+                    ctx.beginPath(); ctx.arc(x1, y1, 2.0, 0, Math.PI*2); ctx.fill();
+                    ctx.beginPath(); ctx.arc(x2, y2, 2.0, 0, Math.PI*2); ctx.fill();
+                }
+            }
+
+            if (state.isActive && state.enemy.isSpawned) {
+                ctx.save();
+                ctx.fillStyle = 'var(--accent-red)';
+                ctx.shadowColor = 'var(--accent-red)';
+                ctx.shadowBlur = 10;
+                ctx.beginPath(); ctx.arc(state.enemy.x, state.enemy.y, state.enemy.radius, 0, Math.PI * 2); ctx.fill();
+                ctx.restore();
+            }
+
+            ctx.save();
+            if(state.isGhostMode) {
+                ctx.shadowColor = '#6f42c1'; ctx.shadowBlur = 12;
+                ctx.fillStyle = 'rgba(111, 66, 193, 0.85)';
+            } else {
+                ctx.fillStyle = 'var(--accent-purple)';
+            }
+            ctx.beginPath(); ctx.arc(state.player.x, state.player.y, state.playerRadius, 0, Math.PI*2); ctx.fill();
+            ctx.strokeStyle = '#000000'; ctx.lineWidth = 1.5; ctx.stroke();
+            ctx.restore();
+
+            ctx.restore(); 
+
+            requestAnimationFrame(loop);
+        }
+
+        initLevel();
+        requestAnimationFrame(loop);
+    </script>
+</body>
+</html>
